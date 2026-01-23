@@ -128,10 +128,15 @@ def get_skill_description(skill_dir):
     except Exception as e:
         return f"读取错误: {e}"
 
-def calculate_dir_hash(directory):
+def calculate_dir_hash(directory, ignore_func=None):
     if not os.path.exists(directory): return None
     sha256 = hashlib.sha256()
     for root, dirs, files in os.walk(directory):
+        if ignore_func:
+            ignored = ignore_func(root, dirs + files)
+            dirs[:] = [d for d in dirs if d not in ignored]
+            files[:] = [f for f in files if f not in ignored]
+            
         dirs.sort()
         files.sort()
         for d in dirs: sha256.update(d.encode('utf-8'))
@@ -189,6 +194,24 @@ def center_window_relative(window, parent, width, height):
     x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
     y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
     window.geometry(f"{width}x{height}+{x}+{y}")
+
+def get_ignore_patterns(src_dir):
+    """Read .gitignore and return patterns to ignore."""
+    gitignore_path = os.path.join(src_dir, '.gitignore')
+    patterns = []
+    if os.path.exists(gitignore_path):
+        try:
+            with open(gitignore_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        # Remove trailing slash as shutil.ignore_patterns matches names
+                        if line.endswith('/'):
+                            line = line[:-1]
+                        patterns.append(line)
+        except Exception as e:
+            print(f"Error reading .gitignore: {e}")
+    return patterns
 
 # --- Data Management ---
 
@@ -453,7 +476,19 @@ class DiffViewerDialog(ctk.CTkToplevel):
     def analyze_files(self):
         self.diff_files = []
         
-        for root, _, files in os.walk(self.source_path):
+        # Setup ignore function based on source .gitignore
+        patterns = get_ignore_patterns(self.source_path)
+        ignore_func = shutil.ignore_patterns(*patterns) if patterns else None
+        
+        def walk_with_ignore(path):
+            for root, dirs, files in os.walk(path):
+                if ignore_func:
+                    ignored = ignore_func(root, dirs + files)
+                    dirs[:] = [d for d in dirs if d not in ignored]
+                    files[:] = [f for f in files if f not in ignored]
+                yield root, dirs, files
+        
+        for root, _, files in walk_with_ignore(self.source_path):
             for f in files:
                 rel_path = os.path.relpath(os.path.join(root, f), self.source_path)
                 tgt_f = os.path.join(self.target_path, rel_path)
@@ -464,7 +499,7 @@ class DiffViewerDialog(ctk.CTkToplevel):
                 elif self.is_different(src_f, tgt_f):
                     self.diff_files.append((rel_path, "Modified"))
                     
-        for root, _, files in os.walk(self.target_path):
+        for root, _, files in walk_with_ignore(self.target_path):
             for f in files:
                 rel_path = os.path.relpath(os.path.join(root, f), self.target_path)
                 if not os.path.exists(os.path.join(self.source_path, rel_path)):
@@ -910,7 +945,11 @@ class SkillsManagerPage(ctk.CTkFrame):
                     is_diff = False
                     
                     if in_target:
-                        if calculate_dir_hash(s_path) == calculate_dir_hash(t_path):
+                        # Get ignore patterns for hash calculation
+                        patterns = get_ignore_patterns(s_path)
+                        ignore_func = shutil.ignore_patterns(*patterns) if patterns else None
+                        
+                        if calculate_dir_hash(s_path, ignore_func) == calculate_dir_hash(t_path, ignore_func):
                             status = "✅ 一致"
                             color = "gray"
                         else:
@@ -977,7 +1016,14 @@ class SkillsManagerPage(ctk.CTkFrame):
             dst = os.path.join(self.target_dir, skill)
             try:
                 if os.path.exists(dst): shutil.rmtree(dst)
-                shutil.copytree(src, dst)
+                
+                # Check for .gitignore and use it
+                ignore_func = None
+                patterns = get_ignore_patterns(src)
+                if patterns:
+                    ignore_func = shutil.ignore_patterns(*patterns)
+                    
+                shutil.copytree(src, dst, ignore=ignore_func)
             except Exception as e: messagebox.showerror("Error", str(e))
         self.refresh_all()
         show_message(self, "完成", "导入完成")
