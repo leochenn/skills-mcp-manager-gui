@@ -8,6 +8,8 @@ import difflib
 import base64
 import time
 import threading
+import requests
+import webbrowser
 from io import BytesIO
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -38,11 +40,22 @@ HISTORY_FILE = os.path.join(PROJECT_ROOT, 'history.json')
 
 COLORS = {
     "primary": "#0067c0",
+    "primary_hover": "#005a9e",
+    "text_link": ("#0067c0", "#66b2ff"), # Light/Dark
+    "text_nested": ("#5c2d91", "#b4a0ff"), # Nested Skill Color (Purple)
     "success": "#107c10",
+    "success_bg": ("#e6ffec", "#1e3a29"), # Badge BG
+    "success_text": ("#107c10", "#00e676"), # Badge Text
     "warning": "#d83b01",
+    "warning_bg": ("#ffebe9", "#3a1e1e"),
+    "warning_text": ("#d83b01", "#ffaa44"),
     "danger": "#a80000",
-    "bg_card": ("#ffffff", "#2b2b2b"), # Light/Dark
-    "text_sub": ("#606060", "#a0a0a0")
+    "bg_card": ("#ffffff", "#2b2b2b"),
+    "item_card": ("#f8f9fa", "gray25"),
+    "item_hover": ("#eef0f2", "gray30"),
+    "text_sub": ("#606060", "#a0a0a0"),
+    "neutral_bg": ("#f3f2f1", "gray35"),
+    "neutral_text": ("#605e5c", "#c8c8c8")
 }
 
 # --- Helpers ---
@@ -213,6 +226,360 @@ def get_ignore_patterns(src_dir):
             print(f"Error reading .gitignore: {e}")
     return patterns
 
+class GitHubDownloader:
+    def __init__(self, log_callback):
+        self.log_callback = log_callback
+        self.stop_flag = False
+
+    def download(self, github_url, output_dir):
+        parts = github_url.strip("/").split("/")
+        if "github.com" not in parts:
+            self.log_callback("错误: 不是有效的 GitHub URL", "error")
+            return False
+
+        try:
+            # https://github.com/{owner}/{repo}/tree/{branch}/{path}
+            owner = parts[3]
+            repo = parts[4]
+            branch = parts[6]
+            folder_path = "/".join(parts[7:])
+            skill_name = folder_path.split("/")[-1]
+        except IndexError:
+             self.log_callback("错误: URL 格式解析失败，请确保包含 tree/{branch}/目录路径", "error")
+             return False
+        
+        # New directory structure: TargetDir/Owner/SkillName
+        # BUT: we need to support "collection" downloads.
+        # Logic: 
+        # 1. Start scanning from the given URL.
+        # 2. If SKILL.md found in root -> It's a skill. Download to TargetDir/Owner/SkillName.
+        # 3. If SKILL.md NOT found -> It might be a collection. Scan children.
+        #    For each child dir that contains SKILL.md (directly or nested), hoist it to TargetDir/Owner/ChildName.
+        
+        # We need a new recursive discovery method that decides WHERE to download.
+        # To avoid double request, we can use the first request to determine type.
+        
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{folder_path}?ref={branch}"
+        
+        # Base destination for flattened skills (TargetDir/Owner)
+        base_dest_dir = os.path.join(output_dir, owner)
+        
+        try:
+            self.log_callback(f"正在分析目录结构: {owner}/{repo}/{folder_path}", "info")
+            # Start the smart download process
+            # We pass: 
+            # - current_api_url: URL to scan
+            # - base_dest_dir: Where 'hoisted' skills should end up (e.g. .../anthropics)
+            # - current_rel_path: Relative path from the start of our download (for logging/logic)
+            # - is_root: True for the first call
+            
+            self._smart_download(api_url, base_dest_dir, is_root=True, root_name=skill_name)
+            
+            # Record GitHub Address (record once for the parent URL)
+            self._record_address(base_dest_dir, github_url)
+            
+            self.log_callback("所有下载任务完成！", "success")
+            return True
+        except Exception as e:
+            self.log_callback(f"下载过程出错: {e}", "error")
+            return False
+
+    def _smart_download(self, api_url, base_dest_dir, is_root=False, root_name=None):
+        """
+        Entry point for smart download logic.
+        is_root: True if this is the initial call.
+        root_name: The name of the folder from the original URL (e.g. 'skill-creator' or 'skills').
+        """
+        # If is_root, we just call the recursive function with the root_name as current_dir_name.
+        self._smart_download_recursive(api_url, base_dest_dir, current_dir_name=root_name)
+
+    def _smart_download_recursive(self, api_url, base_dest_dir, current_dir_name=None):
+        """
+        api_url: URL to fetch items from.
+        base_dest_dir: The 'Owner' directory (e.g., .../skills/anthropics).
+        current_dir_name: The name of the current folder we are processing (e.g. 'skill-creator'). 
+                          If None (Root), we try to derive or handled specially.
+                          Actually, for Root, we might have a name from the original URL logic.
+        """
+        if self.stop_flag: return
+        
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        try:
+            response = requests.get(api_url, headers=headers)
+            if response.status_code != 200:
+                self.log_callback(f"Error fetching {api_url}", "error")
+                return
+
+            items = response.json()
+            if isinstance(items, dict) and items.get("type") == "file": items = [items]
+            
+            # Check if this is a Skill
+            has_skill_md = any(item['name'].lower() == 'skill.md' for item in items)
+            
+            if has_skill_md:
+                # IT IS A SKILL!
+                # We should download it.
+                # Target? 
+                # If this was called from a recursion, 'current_dir_name' is the folder name.
+                # We want to put it in base_dest_dir / current_dir_name.
+                
+                # Special Case: Root
+                # If we are at root and it HAS skill.md, we download to base_dest_dir / root_name.
+                # But we need to know root_name.
+                
+                if not current_dir_name:
+                    # Fallback if name not provided (shouldn't happen with proper logic)
+                    self.log_callback("Error: Skill found but name unknown", "error")
+                    return
+
+                target_path = os.path.join(base_dest_dir, current_dir_name)
+                self.log_callback(f"发现 Skill: {current_dir_name}", "success")
+                self.log_callback(f"目标路径: {target_path}", "info")
+                
+                if not os.path.exists(target_path):
+                    os.makedirs(target_path)
+                
+                # Download content
+                self._download_items(items, target_path)
+                return # Done for this branch (it's a skill, we don't look deeper for other skills inside a skill)
+            
+            else:
+                # NOT A SKILL (Collection or Intermediate)
+                # Ignore files.
+                # Dive into directories.
+                # Important: When diving, we reset the "potential target name".
+                # If we are in 'pdf2' (not skill), and we see 'pdf3', 
+                # we call recurse with name='pdf3'.
+                # The target will be base_dest_dir / pdf3.
+                
+                # But wait, what if Root (e.g. 'skill-creator') DOES NOT have skill.md?
+                # Then we treat 'skill-creator' as a collection.
+                # We look at children.
+                
+                # Handling Root Name:
+                # The caller should pass the root name if it's the first call.
+                # But if Root is a collection, we DON'T want to use Root name in the final path for children.
+                # e.g. Root='skills' (collection). Child='pdf'. 
+                # We want .../anthropics/pdf. NOT .../anthropics/skills/pdf.
+                # So we simply ignore current_dir_name if it's not a skill!
+                
+                for item in items:
+                    if self.stop_flag: return
+                    if item['type'] == 'dir':
+                        # Recurse
+                        # We pass item['name'] as the new potential skill name
+                        self._smart_download_recursive(item['url'], base_dest_dir, item['name'])
+                        
+        except Exception as e:
+            self.log_callback(f"Error: {e}", "error")
+
+    def _download_items(self, items, local_path):
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        for item in items:
+            if self.stop_flag: return
+            
+            name = item['name']
+            path = os.path.join(local_path, name)
+            
+            if item['type'] == 'dir':
+                if not os.path.exists(path): os.makedirs(path)
+                # Standard recursive download for content INSIDE a skill
+                self._download_recursive(item['url'], path, "")
+            else:
+                self.log_callback(f"⬇️  正在下载: {name}...", "file_start")
+                resp = requests.get(item['download_url'], headers=headers)
+                with open(path, "wb") as f: f.write(resp.content)
+                self.log_callback(f"下载完成: {name}", "success")
+
+    def _record_address(self, owner_dir, url):
+        try:
+            if not os.path.exists(owner_dir): os.makedirs(owner_dir) # Ensure owner dir exists
+            file_path = os.path.join(owner_dir, "github_address.txt")
+            existing_urls = []
+            
+            if os.path.exists(file_path):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    existing_urls = [line.strip() for line in f.readlines() if line.strip()]
+            
+            # Clean URL (remove trailing slash)
+            url = url.rstrip('/')
+            
+            # Logic: Merge and Deduplicate
+            # 1. If new url is a child of any existing url -> Do nothing (Parent covers it).
+            # 2. If new url is a parent of any existing urls -> Remove children, keep Parent.
+            # 3. If new url is a sibling of any existing url (same parent) -> Merge to Parent.
+            
+            # To handle sibling merging, we need to detect "Sibling" relationship.
+            # Sibling means: They share the same parent directory in the URL structure.
+            # e.g. .../skills/art and .../skills/brand -> share .../skills.
+            
+            # Let's iterate and build a new list.
+            new_list = []
+            is_covered = False
+            
+            # Helper to check parent/child
+            def is_parent_of(parent, child):
+                return child.startswith(parent + '/')
+            
+            def get_parent_url(u):
+                return u.rsplit('/', 1)[0]
+                
+            # First pass: Check if new URL is already covered by existing parents
+            for ex in existing_urls:
+                if ex == url or is_parent_of(ex, url):
+                    is_covered = True
+                    break
+            
+            if is_covered:
+                # Already covered, no change needed.
+                self.log_callback(f"地址已存在或被父级包含，跳过记录。", "info")
+                return
+
+            # Second pass: New URL is NOT covered. 
+            # Check if New URL covers existing children (Reverse of 1).
+            # And also check for SIBLINGS to merge up.
+            
+            # This is tricky because merging up might create a NEW parent that itself needs checking.
+            # So let's add the new URL to the list, then run a "Optimization" pass until stable.
+            
+            current_urls = existing_urls + [url]
+            
+            has_changed = True
+            while has_changed:
+                has_changed = False
+                optimized_urls = set()
+                
+                # Sort to process shorter (parents) first? Or just set?
+                # List for iteration
+                temp_list = sorted(list(set(current_urls)))
+                
+                # 1. Remove children if parent exists
+                parents = set()
+                for u in temp_list:
+                    is_child = False
+                    for other in temp_list:
+                        if u != other and is_parent_of(other, u):
+                            is_child = True
+                            break
+                    if not is_child:
+                        parents.add(u)
+                
+                # Now 'parents' contains only top-level items from the current set.
+                # 2. Check for Siblings among these 'parents'.
+                # We group by their parent URL.
+                
+                groups = {}
+                for u in parents:
+                    p_url = get_parent_url(u)
+                    if p_url not in groups: groups[p_url] = []
+                    groups[p_url].append(u)
+                    
+                final_round_urls = []
+                for p_url, children in groups.items():
+                    # If we have 2 or more children of the same parent -> Merge to Parent
+                    # UNLESS the parent itself is effectively the root (like github.com/anthropics/skills/tree/main).
+                    # Actually, user said: ".../skills/art" and ".../skills/brand" -> ".../skills".
+                    # So yes, merge.
+                    
+                    # But we need to be careful not to merge too high (e.g. github.com/anthropics).
+                    # The user seems to imply merging skill folders.
+                    # Let's assume merging is always safe if they share a parent in the 'tree' path.
+                    # Typically URL: .../tree/{branch}/{path}
+                    # We should only merge if the parent is still inside the 'tree/{branch}' structure.
+                    
+                    if len(children) > 1:
+                        # Merge!
+                        # The new candidate is p_url.
+                        # But wait, p_url might be "github.com/.../tree/main". 
+                        # That's fine.
+                        final_round_urls.append(p_url)
+                        has_changed = True # We changed structure (children -> parent)
+                    else:
+                        final_round_urls.append(children[0])
+                
+                if has_changed:
+                    current_urls = final_round_urls
+                else:
+                    # No sibling merges happened. We are stable.
+                    # 'parents' set from step 1 was already deduplicated.
+                    current_urls = list(parents)
+
+            # Write back if different
+            current_urls.sort()
+            existing_urls.sort()
+            
+            if current_urls != existing_urls:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    for u in current_urls:
+                        f.write(u + "\n")
+                self.log_callback(f"地址记录已更新 (已合并/去重): {file_path}", "info")
+            else:
+                self.log_callback(f"地址记录无需更新。", "info")
+
+        except Exception as e:
+            self.log_callback(f"无法写入地址文件: {e}", "error")
+
+    def _download_recursive(self, api_url, local_base_path, relative_path):
+        if self.stop_flag: return
+
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        try:
+            response = requests.get(api_url, headers=headers)
+            if response.status_code != 200:
+                self.log_callback(f"获取目录信息失败: {api_url} (代码: {response.status_code})", "error")
+                return
+
+            data = response.json()
+            if isinstance(data, dict) and data.get("type") == "file":
+                data = [data]
+
+            for item in data:
+                if self.stop_flag: return
+                
+                item_type = item["type"]
+                item_name = item["name"]
+                
+                # logic to keep relative structure correct
+                # We are downloading folder_path to output_dir.
+                # If we are at root of download, we just put items in output_dir.
+                # But wait, ai_studio_code.py logic:
+                # current_local_path = os.path.join(local_base_path, item_name)
+                # local_base_path starts as output_dir.
+                
+                current_local_path = os.path.join(local_base_path, item_name)
+
+                if item_type == "dir":
+                    if not os.path.exists(current_local_path):
+                        os.makedirs(current_local_path)
+                        self.log_callback(f"📁 创建目录: {item_name}", "dir")
+                    
+                    self._download_recursive(item["url"], current_local_path, "")
+                
+                elif item_type == "file":
+                    download_url = item["download_url"]
+                    self.log_callback(f"⬇️  正在下载: {item_name}...", "file_start")
+                    
+                    file_resp = requests.get(download_url, headers=headers)
+                    with open(current_local_path, "wb") as f:
+                        f.write(file_resp.content)
+                        
+                    self.log_callback(f"下载完成: {item_name}", "success")
+                    # We can update the last log item or just append "Done"
+                    # But for simplicity, I will just log start. 
+                    # Actually, the user screenshot shows "... 完成" at the end of the line.
+                    # Since I am using labels, I can't easily append to the same label unless I keep a reference.
+                    # I will log "Done" as a separate update or just log once when done?
+                    # The screenshot shows: "⬇️ 正在下载: file... 完成"
+                    # I'll implement a way to update the last log or just log "Finished downloading file".
+                    # Let's keep it simple: Log "Downloading...", then "Downloaded".
+                    # Or try to match the screenshot: 
+                    # I will modify the log callback to support updating the last line if needed, 
+                    # or just print "Downloaded: {item_name}".
+                    # For now, let's just log "Downloading..." then nothing if success, or "Done".
+                    
+        except Exception as e:
+             raise e
+
 # --- Data Management ---
 
 class HistoryManager:
@@ -323,20 +690,42 @@ class ScrollableCheckBoxFrame(ctk.CTkScrollableFrame):
                 self.add_item(item)
 
     def add_item(self, item, command=None):
-        frame = ctk.CTkFrame(self, fg_color="transparent")
-        frame.pack(fill="x", pady=2)
+        # Card Frame
+        frame = ctk.CTkFrame(self, fg_color=COLORS["item_card"], corner_radius=6, height=40)
+        frame.pack(fill="x", pady=4, padx=2)
         
+        # Hover Effect
+        def on_enter(e): frame.configure(fg_color=COLORS["item_hover"])
+        def on_leave(e): frame.configure(fg_color=COLORS["item_card"])
+        frame.bind("<Enter>", on_enter)
+        frame.bind("<Leave>", on_leave)
+        
+        # Checkbox
         checkbox = ctk.CTkCheckBox(frame, text="", width=24, checkbox_width=20, checkbox_height=20)
-        checkbox.pack(side="left", padx=(5, 10))
+        checkbox.pack(side="left", padx=(10, 10), pady=10)
+        checkbox.bind("<Enter>", on_enter)
+        checkbox.bind("<Leave>", on_leave)
+        
+        # Click Logic for Frame (Toggle Checkbox)
+        def toggle_check(e):
+            if checkbox.get(): checkbox.deselect()
+            else: checkbox.select()
+        
+        frame.bind("<Button-1>", toggle_check)
         
         if command:
             # Clickable label
             btn = ctk.CTkButton(frame, text=item, anchor="w", fg_color="transparent", text_color=COLORS["primary"], 
-                              command=command, hover_color=("gray90", "gray20"))
-            btn.pack(side="left", fill="x", expand=True)
+                              command=command, height=24, hover_color=COLORS["item_hover"], font=("Segoe UI", 13, "bold"))
+            btn.pack(side="left", fill="x", expand=True, padx=5)
+            btn.bind("<Enter>", on_enter)
+            btn.bind("<Leave>", on_leave)
         else:
-            lbl = ctk.CTkLabel(frame, text=item, anchor="w")
-            lbl.pack(side="left", fill="x", expand=True)
+            lbl = ctk.CTkLabel(frame, text=item, anchor="w", font=("Segoe UI", 13, "bold"))
+            lbl.pack(side="left", fill="x", expand=True, padx=5)
+            lbl.bind("<Enter>", on_enter)
+            lbl.bind("<Leave>", on_leave)
+            lbl.bind("<Button-1>", toggle_check)
             
         self.checkboxes.append({"checkbox": checkbox, "value": item})
 
@@ -361,9 +750,11 @@ class ScrollableCheckBoxFrame(ctk.CTkScrollableFrame):
 
 
 class CompareListFrame(ctk.CTkScrollableFrame):
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, skills_dir=None, **kwargs):
         super().__init__(master, **kwargs)
         self.rows = []
+        self.groups = {}
+        self.skills_dir = skills_dir
 
     def add_header(self, columns):
         header_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -371,36 +762,203 @@ class CompareListFrame(ctk.CTkScrollableFrame):
         for text, width in columns:
             ctk.CTkLabel(header_frame, text=text, width=width * 10, font=("Segoe UI", 12, "bold"), anchor="w").pack(side="left", padx=5)
         
-    def add_row(self, data, can_check=True, default_check=False, status_color=None, diff_command=None, name_command=None):
-        row_frame = ctk.CTkFrame(self, fg_color=("white", "gray20"), corner_radius=6)
-        row_frame.pack(fill="x", pady=2, padx=2)
+    def add_group(self, name):
+        if name in self.groups: return self.groups[name]
+        
+        container = ctk.CTkFrame(self, fg_color="transparent")
+        container.pack(fill="x", pady=(10, 2))
+        
+        # Header Row Frame
+        header_frame = ctk.CTkFrame(container, fg_color="transparent")
+        header_frame.pack(fill="x")
+        
+        # 1. Toggle Arrow
+        arrow_btn = ctk.CTkButton(header_frame, text="▼", width=24, anchor="center", 
+                                fg_color="transparent", text_color=("gray50", "gray70"), 
+                                font=("Segoe UI", 11, "bold"),
+                                hover_color=("gray90", "gray25"), height=24,
+                                command=lambda n=name: self.toggle_group(n))
+        arrow_btn.pack(side="left")
+
+        # 2. Name (Link or Label)
+        url = None
+        if self.skills_dir:
+            url_file = os.path.join(self.skills_dir, name, "github_address.txt")
+            if os.path.exists(url_file):
+                try:
+                    with open(url_file, "r", encoding="utf-8") as f:
+                        url = f.readline().strip()
+                except: pass
+        
+        if url:
+            # Use Label instead of Button to avoid focus border/shadow issues completely
+            name_label = ctk.CTkLabel(header_frame, text=name, anchor="w", 
+                                    text_color=COLORS["primary"],
+                                    font=("Segoe UI", 11, "bold", "underline"))
+            
+            def on_enter(e): name_label.configure(text_color=COLORS["text_link"], cursor="hand2")
+            def on_leave(e): name_label.configure(text_color=COLORS["primary"], cursor="")
+            
+            name_label.bind("<Enter>", on_enter)
+            name_label.bind("<Leave>", on_leave)
+            name_label.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+            name_label.pack(side="left", padx=(0, 5))
+            
+        else:
+            # Non-link label
+            name_label = ctk.CTkLabel(header_frame, text=name, anchor="w", 
+                                    text_color=("gray50", "gray70"),
+                                    font=("Segoe UI", 11, "bold"))
+            
+            # Allow clicking label to toggle too, for convenience
+            name_label.bind("<Button-1>", lambda e, n=name: self.toggle_group(n))
+            name_label.pack(side="left", padx=(0, 5))
+
+        # 3. Spacer (Right Area - Toggle)
+        # Use Frame instead of Button to avoid focus/hover artifacts
+        spacer_frame = ctk.CTkFrame(header_frame, fg_color="transparent", height=24)
+        spacer_frame.pack(side="left", fill="x", expand=True)
+        
+        # Bind click to toggle
+        def on_spacer_enter(e): spacer_frame.configure(fg_color=("gray90", "gray25"))
+        def on_spacer_leave(e): spacer_frame.configure(fg_color="transparent")
+        
+        spacer_frame.bind("<Enter>", on_spacer_enter)
+        spacer_frame.bind("<Leave>", on_spacer_leave)
+        spacer_frame.bind("<Button-1>", lambda e, n=name: self.toggle_group(n))
+        
+        content = ctk.CTkFrame(container, fg_color="transparent")
+        content.pack(fill="x", padx=(10, 0))
+        
+        self.groups[name] = {"container": container, "arrow_btn": arrow_btn, "content": content, "expanded": True}
+        return self.groups[name]
+
+    def toggle_group(self, name):
+        group = self.groups.get(name)
+        if not group: return
+        
+        if group["expanded"]:
+            group["content"].pack_forget()
+            group["arrow_btn"].configure(text="▶")
+            group["expanded"] = False
+        else:
+            group["content"].pack(fill="x", padx=(10, 0))
+            group["arrow_btn"].configure(text="▼")
+            group["expanded"] = True
+
+    def expand_all(self):
+        for name in self.groups:
+            group = self.groups[name]
+            if not group["expanded"]:
+                group["content"].pack(fill="x", padx=(10, 0))
+                group["arrow_btn"].configure(text="▼")
+                group["expanded"] = True
+                
+    def collapse_all(self):
+        for name in self.groups:
+            group = self.groups[name]
+            if group["expanded"]:
+                group["content"].pack_forget()
+                group["arrow_btn"].configure(text="▶")
+                group["expanded"] = False
+
+    def add_row(self, data, can_check=True, default_check=False, status_color=None, diff_command=None, name_command=None, group=None):
+        parent = self
+        if group:
+            g = self.add_group(group)
+            parent = g["content"]
+            
+        # Card Frame
+        row_frame = ctk.CTkFrame(parent, fg_color=COLORS["item_card"], corner_radius=6, height=40)
+        row_frame.pack(fill="x", pady=4, padx=2)
+        
+        # Hover Effect
+        def on_enter(e): row_frame.configure(fg_color=COLORS["item_hover"])
+        def on_leave(e): row_frame.configure(fg_color=COLORS["item_card"])
+        row_frame.bind("<Enter>", on_enter)
+        row_frame.bind("<Leave>", on_leave)
         
         # Checkbox
         checkbox = ctk.CTkCheckBox(row_frame, text="", width=24, checkbox_width=20, checkbox_height=20)
         if default_check: checkbox.select()
         if not can_check: checkbox.configure(state="disabled")
-        checkbox.pack(side="left", padx=(10, 5), pady=8)
+        checkbox.pack(side="left", padx=(10, 10), pady=10)
+        checkbox.bind("<Enter>", on_enter)
+        checkbox.bind("<Leave>", on_leave)
         
-        # Name
-        if name_command:
-            btn = ctk.CTkButton(row_frame, text=data['name'], anchor="w", fg_color="transparent", 
-                              text_color=COLORS["primary"], command=name_command, width=200, hover_color=("gray90", "gray30"))
-            btn.pack(side="left", padx=5)
-        else:
-            ctk.CTkLabel(row_frame, text=data['name'], width=200, anchor="w").pack(side="left", padx=5)
-            
-        # Status
+        # Click Logic for Frame (Toggle Checkbox)
+        def toggle_check(e):
+            if can_check:
+                if checkbox.get(): checkbox.deselect()
+                else: checkbox.select()
+        
+        row_frame.bind("<Button-1>", toggle_check)
+        
+        # Status Badge (Pack Right)
         status_text = data.get('status', '')
-        if not status_color: status_color = "text_color"
+        # Clean status text
+        status_clean = status_text.replace("✅ ", "").replace("🆕 ", "").replace("⚠️ ", "").strip()
         
-        # Pill for status
-        status_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
-        status_frame.pack(side="left", padx=5)
-        ctk.CTkLabel(status_frame, text=status_text, text_color=status_color, width=100, anchor="w").pack()
+        badge_bg = "gray"
+        badge_text = "white"
+        
+        if "一致" in status_text:
+            badge_bg = COLORS["neutral_bg"]
+            badge_text = COLORS["neutral_text"]
+            status_clean = "一致"
+        elif "新增" in status_text:
+            badge_bg = COLORS["success_bg"]
+            badge_text = COLORS["success_text"]
+            status_clean = "新增"
+        elif "差异" in status_text:
+            badge_bg = COLORS["warning_bg"]
+            badge_text = COLORS["warning_text"]
+            status_clean = "差异"
+            
+        status_frame = ctk.CTkFrame(row_frame, fg_color=badge_bg, corner_radius=10, height=24)
+        status_frame.pack(side="right", padx=(5, 10))
+        status_frame.bind("<Enter>", on_enter)
+        status_frame.bind("<Leave>", on_leave)
+        status_frame.bind("<Button-1>", toggle_check)
+        
+        ctk.CTkLabel(status_frame, text=f" {status_clean} ", text_color=badge_text, font=("Segoe UI", 11, "bold")).pack(padx=8, pady=2)
+        
+        # Ensure label inside badge passes click to frame logic
+        for child in status_frame.winfo_children():
+            child.bind("<Button-1>", toggle_check)
 
-        # Action Button
+        # Action Button (Pack Right - Left of Status)
         if diff_command:
-            ctk.CTkButton(row_frame, text="差异", width=60, height=24, command=diff_command, fg_color="transparent", border_width=1, text_color=COLORS["text_sub"]).pack(side="left", padx=10)
+            diff_btn = ctk.CTkButton(row_frame, text="👁️", width=30, height=24, command=diff_command, 
+                                   fg_color="transparent", hover_color=("gray80", "gray40"), 
+                                   text_color=COLORS["text_sub"], font=("Segoe UI", 14))
+            diff_btn.pack(side="right", padx=5)
+            diff_btn.bind("<Enter>", on_enter)
+            diff_btn.bind("<Leave>", on_leave)
+
+        # Name (Pack Left - Fill Remaining)
+        name_color = COLORS["text_nested"] if group else COLORS["text_link"]
+        
+        if name_command:
+            # Use Label instead of Button to avoid occupying full width
+            lbl = ctk.CTkLabel(row_frame, text=data['name'], anchor="w", 
+                             text_color=name_color, font=("Segoe UI", 13, "bold"))
+            lbl.pack(side="left", padx=5) # No expand/fill
+            
+            # Bind events
+            lbl.bind("<Enter>", on_enter)
+            lbl.bind("<Leave>", on_leave)
+            lbl.bind("<Button-1>", lambda e: name_command())
+            
+            # Add hand cursor to indicate clickable link
+            try: lbl.configure(cursor="hand2")
+            except: pass
+        else:
+            lbl = ctk.CTkLabel(row_frame, text=data['name'], anchor="w", font=("Segoe UI", 13, "bold"), text_color=name_color)
+            lbl.pack(side="left", padx=5, fill="x", expand=True)
+            lbl.bind("<Enter>", on_enter)
+            lbl.bind("<Leave>", on_leave)
+            lbl.bind("<Button-1>", toggle_check)
             
         self.rows.append({"checkbox": checkbox, "data": data})
 
@@ -411,6 +969,7 @@ class CompareListFrame(ctk.CTkScrollableFrame):
         for widget in self.winfo_children():
             widget.destroy()
         self.rows = []
+        self.groups = {}
         
     def set_message(self, message):
         self.clear()
@@ -691,6 +1250,7 @@ class HomePage(ctk.CTkFrame):
         # Icons
         self.icon_skills = load_icon(ICON_FOLDER, size=(24, 24))
         self.icon_mcp = load_icon(ICON_MCP, size=(24, 24))
+        self.icon_install = load_icon(ICON_IMPORT, size=(24, 24))
         self.icon_settings = load_icon(ICON_SETTINGS, size=(20, 20))
         
         # Header
@@ -704,8 +1264,9 @@ class HomePage(ctk.CTkFrame):
         dash_frame = ctk.CTkFrame(self, fg_color="transparent")
         dash_frame.pack(fill="x", padx=40, pady=20)
         
-        self.create_dash_card(dash_frame, "Skills 管理", "管理和同步 AI Skills", self.icon_skills, self.on_manage_skills).pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.create_dash_card(dash_frame, "MCP 管理", "管理 MCP 服务器配置", self.icon_mcp, self.on_manage_mcp).pack(side="left", fill="x", expand=True, padx=(10, 0))
+        self.create_dash_card(dash_frame, "Skills 管理", "管理和同步 AI Skills", self.icon_skills, self.on_manage_skills).pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.create_dash_card(dash_frame, "安装 Skills", "从 GitHub 下载 Skills", self.icon_install, self.on_install_skills).pack(side="left", fill="x", expand=True, padx=5)
+        self.create_dash_card(dash_frame, "MCP 管理", "管理 MCP 服务器配置", self.icon_mcp, self.on_manage_mcp).pack(side="left", fill="x", expand=True, padx=(5, 0))
         
         # Recent History
         ctk.CTkLabel(self, text="最近使用的项目", font=("Segoe UI", 16, "bold"), anchor="w").pack(fill="x", padx=40, pady=(30, 10))
@@ -843,6 +1404,9 @@ class HomePage(ctk.CTkFrame):
         path = filedialog.askdirectory(title="选择 Skills 目标目录")
         if path: self.controller.show_skills_page(path)
 
+    def on_install_skills(self):
+        self.controller.show_install_skills_page()
+
     def on_manage_mcp(self):
         path = filedialog.askopenfilename(title="选择 settings.json", filetypes=[("JSON", "*.json")])
         if path: self.controller.show_mcp_page(path)
@@ -903,10 +1467,22 @@ class SkillsManagerPage(ctk.CTkFrame):
         right_card = ctk.CTkFrame(content, fg_color=("white", "gray20"), corner_radius=10)
         right_card.pack(side="right", fill="both", expand=True, padx=(10, 0))
         
-        ctk.CTkLabel(right_card, text="☁️ 可用 Skills (源)", font=("Segoe UI", 14, "bold")).pack(pady=10, padx=10, anchor="w")
-        self.right_list = CompareListFrame(right_card)
+        right_header = ctk.CTkFrame(right_card, fg_color="transparent")
+        right_header.pack(fill="x", pady=10, padx=10)
+        
+        ctk.CTkLabel(right_header, text="☁️ 可用 Skills (源)", font=("Segoe UI", 14, "bold")).pack(side="left")
+        
+        self.right_list = CompareListFrame(right_card, skills_dir=app_config.skills_dir)
         self.right_list.pack(fill="both", expand=True, padx=10, pady=5)
         self.right_list.add_header([("选择", 4), ("名称", 15), ("状态", 8), ("操作", 5)])
+        
+        # Add Expand/Collapse buttons
+        ctk.CTkButton(right_header, text="全部展开", width=60, height=20, font=("Segoe UI", 10), 
+                      fg_color="transparent", border_width=1, text_color="gray", 
+                      command=self.right_list.expand_all).pack(side="right", padx=5)
+        ctk.CTkButton(right_header, text="全部折叠", width=60, height=20, font=("Segoe UI", 10), 
+                      fg_color="transparent", border_width=1, text_color="gray", 
+                      command=self.right_list.collapse_all).pack(side="right", padx=5)
         
         ctk.CTkButton(right_card, text=" 导入 / 更新选中", image=self.icon_import, fg_color=COLORS["primary"], command=self.import_selected).pack(fill="x", padx=10, pady=10)
         
@@ -932,13 +1508,27 @@ class SkillsManagerPage(ctk.CTkFrame):
             if not os.path.exists(app_config.skills_dir):
                 error_msg = "源目录不存在，请在设置中配置"
             else:
-                def is_valid(n): return os.path.isdir(os.path.join(app_config.skills_dir, n)) and os.path.exists(os.path.join(app_config.skills_dir, n, 'SKILL.md'))
-                source_skills = [i for i in os.listdir(app_config.skills_dir) if is_valid(i)]
+                source_skills = []
+                for root, dirs, files in os.walk(app_config.skills_dir):
+                    if 'SKILL.md' in files:
+                        rel_path = os.path.relpath(root, app_config.skills_dir).replace("\\", "/")
+                        source_skills.append(rel_path)
                 
-                for skill in sorted(source_skills):
-                    s_path = os.path.join(app_config.skills_dir, skill)
-                    t_path = os.path.join(self.target_dir, skill)
-                    in_target = skill in target_skills
+                for skill_rel_path in sorted(source_skills):
+                    s_path = os.path.join(app_config.skills_dir, skill_rel_path)
+                    # Use basename to flatten directory structure in target
+                    t_path = os.path.join(self.target_dir, os.path.basename(skill_rel_path))
+                    
+                    # Determine Group and Display Name
+                    parts = skill_rel_path.split("/")
+                    if len(parts) > 1:
+                        group_name = "/".join(parts[:-1])
+                        display_name = parts[-1]
+                    else:
+                        group_name = None
+                        display_name = parts[0]
+
+                    in_target = os.path.exists(t_path)
                     
                     status = "🆕 新增"
                     color = COLORS["success"]
@@ -958,12 +1548,14 @@ class SkillsManagerPage(ctk.CTkFrame):
                             is_diff = True
                     
                     right_rows.append({
-                        "name": skill,
+                        "name": display_name,
+                        "rel_path": skill_rel_path,
                         "status": status,
                         "color": color,
                         "is_diff": is_diff,
                         "s_path": s_path,
-                        "t_path": t_path
+                        "t_path": t_path,
+                        "group": group_name
                     })
             
             self.after(0, lambda: self._update_ui(target_skills, right_rows, error_msg))
@@ -990,10 +1582,11 @@ class SkillsManagerPage(ctk.CTkFrame):
                     diff_cmd = lambda s=row["name"], sp=row["s_path"], tp=row["t_path"]: DiffViewerDialog(self, s, sp, tp)
                 
                 self.right_list.add_row(
-                    {"name": row["name"], "status": row["status"]},
+                    {"name": row["name"], "rel_path": row["rel_path"], "status": row["status"]},
                     status_color=row["color"],
                     diff_command=diff_cmd,
-                    name_command=lambda s=row["name"], sp=row["s_path"]: DescriptionDialog(self, f"Skill: {s}", get_skill_description(sp))
+                    name_command=lambda s=row["name"], sp=row["s_path"]: DescriptionDialog(self, f"Skill: {s}", get_skill_description(sp)),
+                    group=row["group"]
                 )
         
         self.controller.hide_loading()
@@ -1011,9 +1604,10 @@ class SkillsManagerPage(ctk.CTkFrame):
         items = self.right_list.get_checked_items()
         if not items: return
         for item in items:
-            skill = item['name']
+            skill = item.get('rel_path', item['name'])
             src = os.path.join(app_config.skills_dir, skill)
-            dst = os.path.join(self.target_dir, skill)
+            # Use basename to flatten directory structure in target
+            dst = os.path.join(self.target_dir, os.path.basename(skill))
             try:
                 if os.path.exists(dst): shutil.rmtree(dst)
                 
@@ -1181,6 +1775,142 @@ class MCPManagerPage(ctk.CTkFrame):
         with open(self.target_file, 'w', encoding='utf-8') as f:
             json.dump(self.current_data, f, indent=2, ensure_ascii=False)
 
+class InstallSkillsPage(ctk.CTkFrame):
+    def __init__(self, parent, controller):
+        super().__init__(parent, fg_color="transparent")
+        self.controller = controller
+        
+        self.icon_back = load_icon(ICON_BACK, size=(16, 16))
+        
+        # Header
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=20, pady=20)
+        ctk.CTkButton(header, text=" 返回", image=self.icon_back, command=controller.show_home, width=80, fg_color="transparent", border_width=1, text_color=("black", "white")).pack(side="left")
+        ctk.CTkLabel(header, text="安装 Skills", font=("Segoe UI", 20, "bold"), text_color=COLORS["primary"]).pack(side="left", padx=20)
+
+        # Content
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        
+        # Input Area
+        input_frame = ctk.CTkFrame(content, fg_color=("white", "gray20"), corner_radius=10)
+        input_frame.pack(fill="x", pady=(0, 10))
+        
+        # URL
+        ctk.CTkLabel(input_frame, text="GitHub 目录链接:", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
+        self.url_entry = ctk.CTkEntry(input_frame, placeholder_text="例如: https://github.com/langgenius/dify/tree/main/.agents/skills")
+        self.url_entry.pack(fill="x", padx=20, pady=(0, 15))
+        
+        # Target Dir
+        ctk.CTkLabel(input_frame, text="安装目标目录:", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=20, pady=(5, 5))
+        dir_box = ctk.CTkFrame(input_frame, fg_color="transparent")
+        dir_box.pack(fill="x", padx=20, pady=(0, 20))
+        
+        self.target_var = tk.StringVar(value=app_config.skills_dir)
+        ctk.CTkEntry(dir_box, textvariable=self.target_var).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(dir_box, text="浏览", width=60, command=self.browse_target, fg_color=COLORS["primary"]).pack(side="left", padx=(5,0))
+        
+        # Action
+        self.btn_install = ctk.CTkButton(input_frame, text="开始安装", command=self.start_install, fg_color=COLORS["primary"], height=40, font=("Segoe UI", 14, "bold"))
+        self.btn_install.pack(fill="x", padx=20, pady=(0, 20))
+
+        # Logs
+        log_frame = ctk.CTkFrame(content, fg_color=("white", "gray20"), corner_radius=10)
+        log_frame.pack(fill="both", expand=True)
+        
+        ctk.CTkLabel(log_frame, text="安装进度", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=20, pady=(10, 5))
+        
+        self.log_area = ctk.CTkScrollableFrame(log_frame, fg_color="transparent")
+        self.log_area.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        
+    def browse_target(self):
+        path = filedialog.askdirectory(initialdir=self.target_var.get())
+        if path: self.target_var.set(path)
+        
+    def log(self, text, type="info"):
+        self.after(0, lambda: self._add_log_item(text, type))
+        
+    def _add_log_item(self, text, type):
+        row = ctk.CTkFrame(self.log_area, fg_color="transparent")
+        row.pack(fill="x", pady=0) # Compact packing
+        
+        color = None # Default color (usually black/white depending on mode)
+        icon = ""
+        if type == "error": color = COLORS["danger"]; icon = "❌ "
+        elif type == "success": color = COLORS["success"]; icon = "✅ "
+        elif type == "dir": color = COLORS["primary"]; icon = "📁 "
+        elif type == "file_start": icon = "⬇️ "
+        
+        # If color is explicitly set to None, don't pass text_color arg to let CTk handle it
+        kwargs = {"text": icon + text, "anchor": "w", "font": ("Consolas", 12)}
+        if color:
+            kwargs["text_color"] = color
+            
+        ctk.CTkLabel(row, **kwargs).pack(fill="x")
+        
+        self.update_idletasks()
+        try:
+            self.log_area._parent_canvas.yview_moveto(1.0)
+        except: pass
+
+    def start_install(self):
+        if hasattr(self, "is_installing") and self.is_installing:
+            # Stop logic
+            if self.downloader:
+                self.downloader.stop_flag = True
+                self.log("正在停止下载...", "warning")
+                self.btn_install.configure(state="disabled", text="正在停止...")
+            return
+
+        url = self.url_entry.get().strip()
+        target = self.target_var.get().strip()
+        
+        if not url: return messagebox.showerror("错误", "请输入 GitHub 链接")
+        if not target: return messagebox.showerror("错误", "请选择目标目录")
+        
+        # Pre-check for duplicate directory
+        try:
+            parts = url.strip("/").split("/")
+            if "github.com" in parts:
+                owner = parts[3]
+                folder_path = "/".join(parts[7:])
+                skill_name = folder_path.split("/")[-1]
+                
+                final_output_dir = os.path.join(target, owner, skill_name)
+                
+                if os.path.exists(final_output_dir):
+                    if not messagebox.askyesno("确认覆盖", f"目标目录已存在，是否覆盖？\n\n{final_output_dir}"):
+                        return
+        except: pass # Let downloader handle parsing errors
+        
+        if not os.path.exists(target):
+            try: os.makedirs(target)
+            except Exception as e: return messagebox.showerror("错误", f"无法创建目录: {e}")
+            
+        self.is_installing = True
+        self.btn_install.configure(state="normal", text="停止安装", fg_color=COLORS["warning"], hover_color="#b33000")
+        
+        for widget in self.log_area.winfo_children(): widget.destroy()
+        
+        threading.Thread(target=self._run_install, args=(url, target), daemon=True).start()
+        
+    def _run_install(self, url, target):
+        self.downloader = GitHubDownloader(self.log)
+        success = self.downloader.download(url, target)
+        self.is_installing = False
+        self.downloader = None
+        
+        if success:
+            self.after(0, lambda: self._install_finished("success"))
+        else:
+            self.after(0, lambda: self._install_finished("error"))
+
+    def _install_finished(self, status):
+        if status == "success":
+            self.btn_install.configure(state="normal", text="已安装", fg_color=COLORS["primary"])
+        else:
+            self.btn_install.configure(state="normal", text="重试安装", fg_color=COLORS["primary"])
+
 class LoadingOverlay(ctk.CTkToplevel):
     def __init__(self, master, message="正在加载..."):
         super().__init__(master)
@@ -1244,6 +1974,9 @@ class SkillsManagerAppV3(ctk.CTk):
 
     def show_home(self): self._switch(HomePage(self.container, self))
     
+    def show_install_skills_page(self):
+        self._switch(InstallSkillsPage(self.container, self))
+
     def show_skills_page(self, path):
         self.history_manager.add_skills_dir(path)
         # Defer loading to the page itself
