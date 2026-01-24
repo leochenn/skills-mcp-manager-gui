@@ -1,6 +1,6 @@
 from tkinter import messagebox
 
-from .deps import ctk
+from ..platform.deps import ctk
 
 
 def center_window(window, width, height):
@@ -45,4 +45,3 @@ def show_message(parent, title, message):
         parent.wait_window(dialog)
     except Exception:
         messagebox.showinfo(title, message)
-

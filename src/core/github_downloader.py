@@ -2,6 +2,8 @@ import os
 
 import requests
 
+from .actions import parse_github_tree_url
+
 
 class GitHubDownloader:
     def __init__(self, log_callback):
@@ -9,20 +11,19 @@ class GitHubDownloader:
         self.stop_flag = False
 
     def download(self, github_url, output_dir):
-        parts = github_url.strip("/").split("/")
-        if "github.com" not in parts:
+        parsed = parse_github_tree_url(github_url)
+        if parsed.get("error") == "not_github":
             self.log_callback("错误: 不是有效的 GitHub URL", "error")
             return False
-
-        try:
-            owner = parts[3]
-            repo = parts[4]
-            branch = parts[6]
-            folder_path = "/".join(parts[7:])
-            skill_name = folder_path.split("/")[-1]
-        except IndexError:
+        if parsed.get("error") == "parse_failed":
             self.log_callback("错误: URL 格式解析失败，请确保包含 tree/{branch}/目录路径", "error")
             return False
+
+        owner = parsed["owner"]
+        repo = parsed["repo"]
+        branch = parsed["branch"]
+        folder_path = parsed["folder_path"]
+        skill_name = parsed["skill_name"]
 
         api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{folder_path}?ref={branch}"
         base_dest_dir = os.path.join(output_dir, owner)

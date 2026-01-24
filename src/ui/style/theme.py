@@ -1,4 +1,4 @@
-from .deps import ctk
+from ..platform.deps import ctk
 
 
 COLORS = {
@@ -25,4 +25,3 @@ COLORS = {
 def setup_theme():
     ctk.set_appearance_mode("System")
     ctk.set_default_color_theme("blue")
-

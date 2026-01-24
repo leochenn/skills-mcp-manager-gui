@@ -1,7 +1,7 @@
 import base64
 from io import BytesIO
 
-from .deps import Image, ctk
+from ..platform.deps import Image, ctk
 
 
 ICON_SETTINGS = "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAA2ElEQVR4nO2YQQ7EIAhFgcxBOZo3nUkXbppOR+GrY/pf0k0rCF9MURFCCCGEkOeiI5y6+/vbt1IKdE6dFfioRHR24OhETBYGj7DXmbU+Ym9oxOgumJZAMrZnXgKiZ/I61pPlE94DiIlRfm2k+kdA9emxG5pAi0pXQd8lklmF9ApkVSyr/wO9CqL3j8nmmGyOoR3+qml0N2q790LWa9Ci4DHmPO7qHWKFFKVapDQc4CdUQug6/otmrqqZ6UYjPPc8gFSzJEpy+15IBci2txIr74UIIYQQQiTOB2RshkzvoJmwAAAAAElFTkSuQmCC"
@@ -20,4 +20,3 @@ def load_icon(b64_data, size=(20, 20), color=None):
         return ctk.CTkImage(light_image=image, dark_image=image, size=size)
     except Exception:
         return None
-
